@@ -35,6 +35,80 @@ ZONE_RED_THRESHOLD = 0.02      # ถ้าโซนใดมีสีแดง >
 ZONE_HIGH_THRESHOLD = 0.05     # >= 5% ถือว่ากระจุกตัวหนัก
 ZONE_SEVERE_THRESHOLD = 0.10   # >= 10% ถือว่ารุนแรง
 
+def analyze_cluster_location(red_result, roi_info):
+    """วิเคราะห์ตำแหน่งหลักของ red clusters"""
+    if not red_result or not red_result['clusters']:
+        return 'center'  # default
+    
+    cx, cy, r = roi_info['cx'], roi_info['cy'], roi_info['r']
+    inner_r = int(r * 0.66)  # ขอบคือนอก 66%
+    
+    edge_clusters = []
+    center_clusters = []
+    
+    # แยกแยะ cluster ตามตำแหน่ง
+    for merged_cluster in red_result['clusters']:
+        for cluster in merged_cluster['clusters']:
+            cluster_x, cluster_y = cluster['centroid']
+            dist_from_center = np.sqrt((cluster_x - cx)**2 + (cluster_y - cy)**2)
+            
+            if dist_from_center >= inner_r:  # อยู่ขอบ
+                # หาทิศทาง
+                angle = np.arctan2(cluster_y - cy, cluster_x - cx)
+                angle_deg = np.degrees(angle) % 360
+                
+                if 315 <= angle_deg or angle_deg < 45:      # ขวา
+                    edge_clusters.append(('right', cluster['area']))
+                elif 45 <= angle_deg < 135:                 # บน
+                    edge_clusters.append(('top', cluster['area']))
+                elif 135 <= angle_deg < 225:                # ซ้าย 
+                    edge_clusters.append(('left', cluster['area']))
+                else:                                        # ล่าง
+                    edge_clusters.append(('bottom', cluster['area']))
+            else:
+                center_clusters.append(cluster['area'])
+    
+    # ตัดสินใจตำแหน่งหลัก
+    total_edge_area = sum(area for _, area in edge_clusters)
+    total_center_area = sum(center_clusters)
+    
+    if total_edge_area > total_center_area:
+        # ขอบมี cluster มากกว่า - ดูว่าขอบไหนเด่น
+        edge_directions = {}
+        for direction, area in edge_clusters:
+            edge_directions[direction] = edge_directions.get(direction, 0) + area
+        
+        if len(edge_directions) >= 3:  # 3+ ขอบมี cluster
+            return 'edge/multiple_edges'
+        elif edge_directions:
+            dominant_edge = max(edge_directions.keys(), key=lambda k: edge_directions[k])
+            return f'edge/{dominant_edge}_edge'
+    
+    return 'center'
+
+def create_output_folders(output_base):
+    """สร้างโฟลเดอร์ตามโครงสร้างใหม่"""
+    folders = {
+        'red_normal': os.path.join(output_base, "red_normal"),
+        'red_high_edge_top': os.path.join(output_base, "red_high_concern", "edge", "top_edge"),
+        'red_high_edge_bottom': os.path.join(output_base, "red_high_concern", "edge", "bottom_edge"),
+        'red_high_edge_left': os.path.join(output_base, "red_high_concern", "edge", "left_edge"),
+        'red_high_edge_right': os.path.join(output_base, "red_high_concern", "edge", "right_edge"),
+        'red_high_edge_multiple': os.path.join(output_base, "red_high_concern", "edge", "multiple_edges"),
+        'red_high_center': os.path.join(output_base, "red_high_concern", "center"),
+        'red_severe_edge_top': os.path.join(output_base, "red_severe_concern", "edge", "top_edge"),
+        'red_severe_edge_bottom': os.path.join(output_base, "red_severe_concern", "edge", "bottom_edge"),
+        'red_severe_edge_left': os.path.join(output_base, "red_severe_concern", "edge", "left_edge"),
+        'red_severe_edge_right': os.path.join(output_base, "red_severe_concern", "edge", "right_edge"),
+        'red_severe_edge_multiple': os.path.join(output_base, "red_severe_concern", "edge", "multiple_edges"),
+        'red_severe_center': os.path.join(output_base, "red_severe_concern", "center"),
+    }
+    
+    for folder_path in folders.values():
+        os.makedirs(folder_path, exist_ok=True)
+    
+    return folders
+
 # === Core Functions ===
 def least_squares_circle_fit(points):
     x = points[:, 0].astype(np.float64)
@@ -435,13 +509,8 @@ def detect_red_in_roi(image, roi_info):
 def main():
     output_base = f"wafer_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     
-    # Create output folders (ปรับตามเงื่อนไขใหม่: normal, high, severe)
-    red_normal = os.path.join(output_base, "red_normal")
-    red_high = os.path.join(output_base, "red_high_concern")
-    red_severe = os.path.join(output_base, "red_severe_concern")
-    
-    for folder in [red_normal, red_high, red_severe]:
-        os.makedirs(folder, exist_ok=True)
+    # Create output folders with subfolders
+    folders = create_output_folders(output_base)
     
     # Load images (already filtered good ROI from previous step)
     patterns = [f'{DATA_PATH}/*.png', f'{DATA_PATH}/*.jpg', f'{DATA_PATH}/*.jpeg']
@@ -451,7 +520,11 @@ def main():
     imgs = list(dict.fromkeys(imgs))
     
     # Counters
-    red_counts = [0, 0, 0]  # normal, high, severe
+    red_counts = {
+        'normal': 0,
+        'high_edge_top': 0, 'high_edge_bottom': 0, 'high_edge_left': 0, 'high_edge_right': 0, 'high_edge_multiple': 0, 'high_center': 0,
+        'severe_edge_top': 0, 'severe_edge_bottom': 0, 'severe_edge_left': 0, 'severe_edge_right': 0, 'severe_edge_multiple': 0, 'severe_center': 0
+    }
     
     print(f"Processing {len(imgs)} images from: {DATA_PATH}")
     print("=" * 60)
@@ -497,9 +570,39 @@ def main():
                         color = zone_colors.get(zs.get('level', 'normal'), (0, 255, 0))
                         cv2.drawContours(vis_red, [c['contour']], -1, color, 2)
                 
+                # วิเคราะห์ตำแหน่งหลักของ cluster
+                cluster_location = analyze_cluster_location(red_result, roi_info)
+                
                 concern = red_result['concern_level']
                 colors = [(0, 255, 0), (0, 165, 255), (0, 0, 255)]  # green, orange, red
                 labels = ["NORMAL", "HIGH", "SEVERE"]
+                
+                # ระบุโฟลเดอร์ปลายทาง
+                if concern == 0:
+                    target_folder = folders['red_normal']
+                    count_key = 'normal'
+                elif concern == 1:
+                    if cluster_location == 'center':
+                        target_folder = folders['red_high_center']
+                        count_key = 'high_center'
+                    elif cluster_location == 'edge/multiple_edges':
+                        target_folder = folders['red_high_edge_multiple']
+                        count_key = 'high_edge_multiple'
+                    else:  # edge/xxx_edge
+                        edge_type = cluster_location.split('/')[-1].replace('_edge', '')
+                        target_folder = folders[f'red_high_edge_{edge_type}']
+                        count_key = f'high_edge_{edge_type}'
+                else:  # concern == 2 (severe)
+                    if cluster_location == 'center':
+                        target_folder = folders['red_severe_center']
+                        count_key = 'severe_center'
+                    elif cluster_location == 'edge/multiple_edges':
+                        target_folder = folders['red_severe_edge_multiple']
+                        count_key = 'severe_edge_multiple'
+                    else:  # edge/xxx_edge
+                        edge_type = cluster_location.split('/')[-1].replace('_edge', '')
+                        target_folder = folders[f'red_severe_edge_{edge_type}']
+                        count_key = f'severe_edge_{edge_type}'
                 
                 # แสดงสถานะที่มุมขวาด้านบน (มีพื้นหลัง)
                 img_h, img_w = vis_red.shape[:2]
@@ -514,42 +617,53 @@ def main():
                 status_text = f"{labels[concern]}"
                 cv2.putText(vis_red, status_text, (img_w-160, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2)
                 
-                # แสดงข้อมูล cluster (ขวาบน บรรทัดที่ 2)
+                # แสดงข้อมูล cluster + ตำแหน่ง (ขวาบน บรรทัดที่ 2)
                 cluster_text = f"Max: {red_result['largest_cluster_ratio']:.1%}"
                 cv2.putText(vis_red, cluster_text, (img_w-160, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.45, text_color, 1)
                 
-                # แสดง sector ที่มีปัญหา (ขวาบน บรรทัดที่ 3-5)
+                # แสดงตำแหน่งหลัก (บรรทัดที่ 3)
+                location_text = cluster_location.replace('edge/', '').replace('_', ' ').title()
+                cv2.putText(vis_red, f"Loc: {location_text}", (img_w-160, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.4, text_color, 1)
+                
+                # แสดง sector ที่มีปัญหา (ขวาบน บรรทัดที่ 4-6)
                 for i, sector_info in enumerate(red_result['high_sectors'][:3]):
-                    y_pos = 75 + i * 18
+                    y_pos = 95 + i * 18
                     cv2.putText(vis_red, sector_info, (img_w-160, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.38, text_color, 1)
                 
-                # Save to appropriate folder
-                folders = [red_normal, red_high, red_severe]
-                cv2.imwrite(os.path.join(folders[concern], img_name), vis_red)
-                red_counts[concern] += 1
+                # Save to appropriate subfolder
+                cv2.imwrite(os.path.join(target_folder, img_name), vis_red)
+                red_counts[count_key] += 1
                 
                 # Print detail
                 cluster_info = f"largest={red_result['largest_cluster_ratio']:.1%}"
-                if red_result['high_sectors']:
-                    sector_info = ", ".join(red_result['high_sectors'][:3])  # แสดงแค่ 3 อันแรก
-                    print(f"{labels[concern]}: {img_name} ({cluster_info}) [{sector_info}]")
-                else:
-                    print(f"{labels[concern]}: {img_name} ({cluster_info})")
+                print(f"{labels[concern]}: {img_name} ({cluster_info}) -> {count_key}")
         else:
             print(f"⚠️ ไม่เจอ ROI: {img_name}")
     
     # Summary
-    total = sum(red_counts)
+    total = sum(red_counts.values())
     print("\n" + "=" * 60)
     print("✅ Processing Complete!")
     print(f"Results saved to: {output_base}")
     print(f"\n🔴 Red Analysis Results:")
-    print(f"  ✅ Normal:    {red_counts[0]} files")
-    print(f"  🔶 High:      {red_counts[1]} files") 
-    print(f"  ❌ Severe:    {red_counts[2]} files")
+    print(f"  ✅ Normal: {red_counts['normal']} files")
+    print(f"  🔶 High Concern: {sum(v for k, v in red_counts.items() if 'high_' in k)} files")
+    print(f"     - Center: {red_counts['high_center']}")
+    print(f"     - Top Edge: {red_counts['high_edge_top']}")
+    print(f"     - Bottom Edge: {red_counts['high_edge_bottom']}")
+    print(f"     - Left Edge: {red_counts['high_edge_left']}")
+    print(f"     - Right Edge: {red_counts['high_edge_right']}")
+    print(f"     - Multiple Edges: {red_counts['high_edge_multiple']}")
+    print(f"  ❌ Severe Concern: {sum(v for k, v in red_counts.items() if 'severe_' in k)} files")
+    print(f"     - Center: {red_counts['severe_center']}")
+    print(f"     - Top Edge: {red_counts['severe_edge_top']}")
+    print(f"     - Bottom Edge: {red_counts['severe_edge_bottom']}")
+    print(f"     - Left Edge: {red_counts['severe_edge_left']}")
+    print(f"     - Right Edge: {red_counts['severe_edge_right']}")
+    print(f"     - Multiple Edges: {red_counts['severe_edge_multiple']}")
     
     if total > 0:
-        print(f"\n  Health score: {red_counts[0]/total*100:.1f}% normal")
+        print(f"\nHealth score: {red_counts['normal']/total*100:.1f}% normal")
     
     # Save summary report
     summary_file = os.path.join(output_base, "analysis_summary.txt")
@@ -557,17 +671,22 @@ def main():
         f.write(f"Wafer Analysis Summary - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Input: {DATA_PATH}\n")
         f.write(f"Total images processed: {len(imgs)}\n")
-        f.write(f"Red Normal: {red_counts[0]}, High: {red_counts[1]}, Severe: {red_counts[2]}\n")
+        total_high = sum(v for k, v in red_counts.items() if 'high_' in k)
+        total_severe = sum(v for k, v in red_counts.items() if 'severe_' in k)
+        f.write(f"Red Normal: {red_counts['normal']}, High: {total_high}, Severe: {total_severe}\n")
         f.write(f"\nClassification Criteria:\n")
         f.write(f"  Normal: largest cluster < 1% of green area\n")
         f.write(f"  High: largest cluster 1-7% of green area\n")
         f.write(f"  Severe: largest cluster > 7% of green area\n")
+        f.write(f"\nSubfolder Organization:\n")
+        f.write(f"  Each level split by location: center / edge (top/bottom/left/right/multiple)\n")
+        f.write(f"  Edge detection: >66% radius from center\n")
         f.write(f"\nSector + Ring Analysis:\n")
         f.write(f"  8 Sectors: S1-S8 (45° each, clockwise from east)\n")
         f.write(f"  3 Rings: Center (<33% radius), Mid (33-66%), Edge (>66%)\n")
         f.write(f"  High density threshold: >3% red pixels in sector-ring\n")
         if total > 0:
-            f.write(f"\nHealth score: {red_counts[0]/total*100:.1f}% normal\n")
+            f.write(f"\nHealth score: {red_counts['normal']/total*100:.1f}% normal\n")
     
     print(f"\n📄 Summary saved: {summary_file}")
 
