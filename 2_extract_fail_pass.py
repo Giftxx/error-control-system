@@ -357,36 +357,68 @@ def detect_red_in_roi(image, roi_info):
     largest_cluster_area = merged_clusters[0]['total_area'] if merged_clusters else 0
     largest_cluster_ratio = largest_cluster_area / roi_area if roi_area > 0 else 0
     
-    # --- ประเมินระดับความรุนแรงรวม ---
-    # นับจำนวนโซนที่มีปัญหา
-    severe_zones = [k for k, v in zone_stats.items() if v['level'] == 'severe']
-    high_zones   = [k for k, v in zone_stats.items() if v['level'] == 'high']
-    moderate_zones = [k for k, v in zone_stats.items() if v['level'] == 'moderate']
+    # --- ประเมินระดับความรุนแรงรวมตามเงื่อนไขใหม่ ---
+    # ใช้ largest_cluster_ratio เป็นหลักในการแบ่ง class
     
-    if len(severe_zones) >= 1 or red_ratio > MAX_SCATTERED_RATIO:
+    if largest_cluster_ratio > 0.07:  # > 7%
         status = "SEVERE"
-        concern_level = 3
-    elif len(high_zones) >= 2 or largest_cluster_ratio > 0.035:
+        concern_level = 2  # 0=normal, 1=high, 2=severe (ไม่มี moderate แยก)
+    elif largest_cluster_ratio >= 0.01:  # 1-7%
         status = "HIGH"
-        concern_level = 2
-    elif len(high_zones) >= 1 or len(moderate_zones) >= 3 or red_ratio > 0.05:
-        status = "MODERATE" 
         concern_level = 1
-    elif len(moderate_zones) >= 1:
-        status = "LOW"
-        concern_level = 1
-    elif red_ratio <= 0.01:
+    else:  # < 1%
         status = "NORMAL"
         concern_level = 0
-    else:
-        status = "NORMAL"
-        concern_level = 0
+    
+    # --- เพิ่มการแบ่ง Sector + Ring ---
+    # แบ่ง 8 Sectors (45° แต่ละ sector)
+    angle = np.arctan2(yy - cy, xx - cx)  # -π to π
+    angle_deg = np.degrees(angle) % 360  # 0-360°
+    
+    sector_masks = {}
+    for i in range(8):
+        start_angle = i * 45
+        end_angle = (i + 1) * 45
+        if end_angle <= 360:
+            sector_mask = (angle_deg >= start_angle) & (angle_deg < end_angle)
+        else:  # wrap around case
+            sector_mask = (angle_deg >= start_angle) | (angle_deg < end_angle - 360)
+        sector_masks[f'S{i+1}'] = sector_mask
+    
+    # แบ่ง 3 Rings (Center, Mid, Edge)
+    ring_masks = {
+        'Center': dist_from_center < (r * 0.33),
+        'Mid': (dist_from_center >= (r * 0.33)) & (dist_from_center < (r * 0.66)),
+        'Edge': dist_from_center >= (r * 0.66)
+    }
+    
+    # คำนวณการกระจายของ red clusters ใน sectors + rings
+    sector_ring_stats = {}
+    for sector_name, sector_mask in sector_masks.items():
+        for ring_name, ring_mask in ring_masks.items():
+            combined = sector_mask & ring_mask & (roi_mask > 0)
+            zone_total = np.sum(combined)
+            zone_red = np.sum(red_binary & combined)
+            zone_density = zone_red / zone_total if zone_total > 0 else 0
+            
+            key = f"{sector_name}-{ring_name}"
+            sector_ring_stats[key] = {
+                'total_pixels': int(zone_total),
+                'red_pixels': int(zone_red), 
+                'density': float(zone_density)
+            }
     
     # สร้าง zone summary string
     zone_summary = []
     for k, v in zone_stats.items():
         if v['level'] != 'normal':
             zone_summary.append(f"{k}={v['density']:.1%}({v['level']})")
+    
+    # เพิ่ม sector-ring ที่มีการกระจุกสูง
+    high_sectors = []
+    for key, stats in sector_ring_stats.items():
+        if stats['density'] > 0.03:  # >3% ถือว่าสูง
+            high_sectors.append(f"{key}={stats['density']:.1%}")
     
     return {
         'red_mask': red_clean, 'red_ratio': red_ratio, 'roi_area': roi_area,
@@ -395,8 +427,7 @@ def detect_red_in_roi(image, roi_info):
         'concern_level': concern_level, 'total_clusters': len(merged_clusters),
         'edge_groups': edge_groups, 'inner_groups': inner_groups,
         'zone_stats': zone_stats, 'zone_summary': zone_summary,
-        'severe_zones': severe_zones, 'high_zones': high_zones,
-        'moderate_zones': moderate_zones,
+        'sector_ring_stats': sector_ring_stats, 'high_sectors': high_sectors,
         'inner_r': inner_r
     }
 
@@ -404,13 +435,12 @@ def detect_red_in_roi(image, roi_info):
 def main():
     output_base = f"wafer_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     
-    # Create output folders (Only red analysis - input already has good ROI)
+    # Create output folders (ปรับตามเงื่อนไขใหม่: normal, high, severe)
     red_normal = os.path.join(output_base, "red_normal")
-    red_moderate = os.path.join(output_base, "red_moderate_concern")
     red_high = os.path.join(output_base, "red_high_concern")
     red_severe = os.path.join(output_base, "red_severe_concern")
     
-    for folder in [red_normal, red_moderate, red_high, red_severe]:
+    for folder in [red_normal, red_high, red_severe]:
         os.makedirs(folder, exist_ok=True)
     
     # Load images (already filtered good ROI from previous step)
@@ -421,7 +451,7 @@ def main():
     imgs = list(dict.fromkeys(imgs))
     
     # Counters
-    red_counts = [0, 0, 0, 0]  # normal, moderate, high, severe
+    red_counts = [0, 0, 0]  # normal, high, severe
     
     print(f"Processing {len(imgs)} images from: {DATA_PATH}")
     print("=" * 60)
@@ -468,33 +498,43 @@ def main():
                         cv2.drawContours(vis_red, [c['contour']], -1, color, 2)
                 
                 concern = red_result['concern_level']
-                colors = [(0, 255, 0), (0, 255, 255), (0, 165, 255), (0, 0, 255)]
-                labels = ["NORMAL", "MODERATE", "HIGH", "SEVERE"]
+                colors = [(0, 255, 0), (0, 165, 255), (0, 0, 255)]  # green, orange, red
+                labels = ["NORMAL", "HIGH", "SEVERE"]
                 
-                # แสดงสถานะรวม
-                cv2.putText(vis_red, f"Red: {labels[concern]} ({red_result['status']})", (10, 30), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, colors[concern], 2)
-                cv2.putText(vis_red, f"Ratio:{red_result['red_ratio']:.1%} Clusters:{red_result['total_clusters']}", 
-                           (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.5, colors[concern], 2)
+                # แสดงสถานะที่มุมขวาด้านบน (มีพื้นหลัง)
+                img_h, img_w = vis_red.shape[:2]
+                text_color = (255, 255, 255)  # สีขาว
                 
-                # แสดงโซนที่มีปัญหา
-                y_pos = 80
-                for zone_key in sorted(red_result['zone_stats'].keys()):
-                    zs = red_result['zone_stats'][zone_key]
-                    if zs['level'] != 'normal':
-                        zcolor = zone_colors[zs['level']]
-                        cv2.putText(vis_red, f"{zone_key}: {zs['density']:.1%} [{zs['level']}]",
-                                   (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.45, zcolor, 1)
-                        y_pos += 20
+                # วาดพื้นหลังดำโปร่งใสสำหรับข้อความ (กล่องสี่เหลี่ยม)
+                overlay = vis_red.copy()
+                cv2.rectangle(overlay, (img_w-170, 10), (img_w-10, 130), (0, 0, 0), -1)  # สีดำ
+                vis_red = cv2.addWeighted(vis_red, 0.2, overlay, 0.8, 0)  # ผสมให้ดำเข้มขึ้น (80% ดำ)
+                
+                # แสดงสถานะหลัก (ขวาบน)
+                status_text = f"{labels[concern]}"
+                cv2.putText(vis_red, status_text, (img_w-160, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2)
+                
+                # แสดงข้อมูล cluster (ขวาบน บรรทัดที่ 2)
+                cluster_text = f"Max: {red_result['largest_cluster_ratio']:.1%}"
+                cv2.putText(vis_red, cluster_text, (img_w-160, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.45, text_color, 1)
+                
+                # แสดง sector ที่มีปัญหา (ขวาบน บรรทัดที่ 3-5)
+                for i, sector_info in enumerate(red_result['high_sectors'][:3]):
+                    y_pos = 75 + i * 18
+                    cv2.putText(vis_red, sector_info, (img_w-160, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.38, text_color, 1)
                 
                 # Save to appropriate folder
-                folders = [red_normal, red_moderate, red_high, red_severe]
+                folders = [red_normal, red_high, red_severe]
                 cv2.imwrite(os.path.join(folders[concern], img_name), vis_red)
                 red_counts[concern] += 1
                 
                 # Print detail
-                zone_info = ", ".join(red_result['zone_summary']) if red_result['zone_summary'] else "all normal"
-                print(f"{labels[concern]}: {img_name} (red={red_result['red_ratio']:.1%}) [{zone_info}]")
+                cluster_info = f"largest={red_result['largest_cluster_ratio']:.1%}"
+                if red_result['high_sectors']:
+                    sector_info = ", ".join(red_result['high_sectors'][:3])  # แสดงแค่ 3 อันแรก
+                    print(f"{labels[concern]}: {img_name} ({cluster_info}) [{sector_info}]")
+                else:
+                    print(f"{labels[concern]}: {img_name} ({cluster_info})")
         else:
             print(f"⚠️ ไม่เจอ ROI: {img_name}")
     
@@ -505,9 +545,8 @@ def main():
     print(f"Results saved to: {output_base}")
     print(f"\n🔴 Red Analysis Results:")
     print(f"  ✅ Normal:    {red_counts[0]} files")
-    print(f"  ⚠️ Moderate:  {red_counts[1]} files")
-    print(f"  🔶 High:      {red_counts[2]} files") 
-    print(f"  ❌ Severe:    {red_counts[3]} files")
+    print(f"  🔶 High:      {red_counts[1]} files") 
+    print(f"  ❌ Severe:    {red_counts[2]} files")
     
     if total > 0:
         print(f"\n  Health score: {red_counts[0]/total*100:.1f}% normal")
@@ -518,12 +557,15 @@ def main():
         f.write(f"Wafer Analysis Summary - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Input: {DATA_PATH}\n")
         f.write(f"Total images processed: {len(imgs)}\n")
-        f.write(f"Red Normal: {red_counts[0]}, Moderate: {red_counts[1]}, High: {red_counts[2]}, Severe: {red_counts[3]}\n")
-        f.write(f"\nZone Detection:\n")
-        f.write(f"  Edge zone = outer {int(EDGE_ZONE_RATIO*100)}% of radius\n")
-        f.write(f"  Inner zone = inner {int((1-EDGE_ZONE_RATIO)*100)}% of radius\n")
-        f.write(f"  Directions: top / bottom / left / right (divided at 45 deg)\n")
-        f.write(f"  Thresholds: moderate>={ZONE_RED_THRESHOLD:.0%}, high>={ZONE_HIGH_THRESHOLD:.0%}, severe>={ZONE_SEVERE_THRESHOLD:.0%}\n")
+        f.write(f"Red Normal: {red_counts[0]}, High: {red_counts[1]}, Severe: {red_counts[2]}\n")
+        f.write(f"\nClassification Criteria:\n")
+        f.write(f"  Normal: largest cluster < 1% of green area\n")
+        f.write(f"  High: largest cluster 1-7% of green area\n")
+        f.write(f"  Severe: largest cluster > 7% of green area\n")
+        f.write(f"\nSector + Ring Analysis:\n")
+        f.write(f"  8 Sectors: S1-S8 (45° each, clockwise from east)\n")
+        f.write(f"  3 Rings: Center (<33% radius), Mid (33-66%), Edge (>66%)\n")
+        f.write(f"  High density threshold: >3% red pixels in sector-ring\n")
         if total > 0:
             f.write(f"\nHealth score: {red_counts[0]/total*100:.1f}% normal\n")
     
