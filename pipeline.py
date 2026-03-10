@@ -1,6 +1,6 @@
-"""
+"""  
 Unified Wafer Analysis Pipeline
-Chains Step 1 (ROI Detection + Good/Bad) → Step 2 (Red Cluster Analysis)
+Chains Step 1 (ROI Detection + Good/Bad) → Step 2 (Red Cluster Analysis) → Step 3 (Error Detection)
 Results saved as JSON for dashboard consumption.
 """
 
@@ -677,7 +677,7 @@ def step2_red_analysis(good_images, output_base):
 def run_pipeline(data_path, roi_output="roi_results", wafer_output=None):
     """
     Run the full pipeline:
-      data_path → Step 1 (ROI + Good/Bad) → Step 2 (Red Analysis)
+      data_path → Step 1 (ROI + Good/Bad) → Step 2 (Red Analysis) → Step 3 (Error Detection)
     
     Args:
         data_path:    Input folder with wafer images
@@ -725,6 +725,66 @@ def run_pipeline(data_path, roi_output="roi_results", wafer_output=None):
         print(f"  ✅ Normal: {step2_result['normal']} | High: {step2_result['high']} | Severe: {step2_result['severe']}")
         print(f"  Health Score: {step2_result['health_score']}%")
 
+        # Step 3 - Error Detection (OCR + classify using PostgreSQL error codes)
+        step3_result = None
+        try:
+            import importlib
+            simple = importlib.import_module("3_simple")
+            # Reload error codes from PostgreSQL
+            simple.ERROR_DB = simple.load_error_db()
+
+            with _pipeline_lock:
+                _pipeline_state["step"] = "Step 3: Error Detection"
+                _pipeline_state["progress"] = 0
+
+            print(f"\n▶ Step 3: Error Detection (OCR + classify)...")
+            data_error_path = simple.DATA_PATH
+            if os.path.isdir(data_error_path):
+                out = simple.make_output(simple.OUTPUT_BASE)
+                machines = simple.discover_machines(data_error_path)
+                print(f"  Found {len(machines)} machine(s): {', '.join(m[0] for m in machines)}")
+
+                exts = ["*.png", "*.jpg", "*.jpeg", "*.PNG", "*.JPG", "*.bmp"]
+                all_err_results = []
+
+                for machine_name, machine_path in machines:
+                    machine_out = simple.make_machine_dirs(out, machine_name)
+                    files = sorted({f for e in exts
+                                    for f in glob.glob(os.path.join(machine_path, e))})
+                    if not files:
+                        continue
+
+                    machine_results = []
+                    for idx, fp in enumerate(files, 1):
+                        with _pipeline_lock:
+                            _pipeline_state["progress"] = idx
+                            _pipeline_state["total"] = len(files)
+                            _pipeline_state["current_file"] = os.path.basename(fp)
+                        r = simple.process_image(fp, machine_out, machine_name=machine_name)
+                        machine_results.append(r)
+
+                    simple.gen_reports(machine_results, machine_out, machine_name=machine_name)
+                    all_err_results.extend(machine_results)
+
+                # Overall report
+                simple.gen_overall_report(all_err_results, out)
+                valid = [r for r in all_err_results if r]
+                clf = [r for r in valid if r.get("category") != "Unknown"]
+                step3_result = {
+                    "total_images": len(all_err_results),
+                    "detected": len(valid),
+                    "classified": len(clf),
+                    "machines": len(machines),
+                    "output_folder": out,
+                }
+                print(f"  ✅ Detected: {len(valid)} errors, Classified: {len(clf)}/{len(valid)} across {len(machines)} machine(s)")
+            else:
+                print(f"  ⚠ data_error folder not found: {data_error_path}, skipping error detection")
+        except Exception as e:
+            print(f"  ⚠ Error Detection (Step 3) failed: {e}")
+            import traceback
+            traceback.print_exc()
+
         elapsed = (datetime.now() - start_time).total_seconds()
 
         # Combined result
@@ -752,6 +812,10 @@ def run_pipeline(data_path, roi_output="roi_results", wafer_output=None):
                 "step2": step2_result["details"],
             },
         }
+
+        # Include Step 3 result if available
+        if step3_result:
+            combined["step3"] = step3_result
 
         # Save JSON result
         result_json = os.path.join(wafer_output, "pipeline_result.json")

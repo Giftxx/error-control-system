@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Data directories (generated / large)
+data/
+data_error/
+data_full_green/
+data_merged/
+
+# Output / evidence directories
+evidence/
+roi_results/
+error_analysis_simple/
+wafer_analysis/
+
+# Test videos
+test_videos/
+*.mp4
+
+# Runtime state files
+active_errors.json
+error_history.json
+latest_pipeline_result.json
+
+# Documentation
+*.md
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
